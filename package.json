@@ -9,6 +9,7 @@
     "dev": "tsx watch src/server.ts",
     "sync": "tsx src/sync.ts",
     "search": "tsx src/search.ts",
+    "test:intuition": "tsx scripts/testIntuitionEndpoint.ts",
     "deploy": "git push heroku main",
     "logs": "heroku logs --tail",
     "get-secrets": "bash scripts/get-heroku-secrets.sh"

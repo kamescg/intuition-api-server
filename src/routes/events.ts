@@ -1,13 +1,71 @@
-import { sync, search } from "@0xintuition/sdk";
+import {
+  sync,
+  search,
+  createAtomFromIpfsUri,
+  createAtomFromString,
+  createTripleStatement,
+  calculateAtomId,
+  calculateTripleId,
+  uploadJsonToPinata,
+  getTripleCost,
+  getAtomCost,
+  MultiVaultAbi,
+} from "@0xintuition/sdk";
+import { toHex, type Hex } from "viem";
 import { Request, Response, Router, text } from "express";
 import { validateApiKey } from "../middleware/auth.js";
-import { intuitionConfig, account } from "../setup.js";
+import { intuitionConfig, account, pinataApiToken } from "../setup.js";
 import { flattenToOneLevel, normalizeFlatValues, isAlreadyExistsError } from "../utils.js";
 import {
   IntuitionEvent,
   QuizCompletedEvent,
   validateEvent,
 } from "../types/events.js";
+
+// Thing interface for the core atom fields
+interface ThingData {
+  name: string;
+  description: string;
+  url: string;
+  image: string;
+}
+
+// Request body for v1/intuition route
+interface IntuitionSyncRequest {
+  thing: ThingData;
+  metadata?: Record<string, unknown>;
+}
+
+// Constant predicate for metadata triples
+const METADATA_PREDICATE = "metadata";
+
+// Helper to check if a term (atom or triple) exists on-chain
+async function isTermCreated(termId: Hex): Promise<boolean> {
+  const { publicClient, address } = intuitionConfig;
+  return await publicClient.readContract({
+    address,
+    abi: MultiVaultAbi,
+    functionName: "isTermCreated",
+    args: [termId],
+  });
+}
+
+// Helper to get or create the metadata predicate atom
+async function getOrCreateMetadataPredicateAtom(): Promise<Hex> {
+  const predicateData = toHex(METADATA_PREDICATE);
+  const predicateAtomId = calculateAtomId(predicateData);
+
+  const exists = await isTermCreated(predicateAtomId);
+  if (!exists) {
+    console.log("Creating metadata predicate atom...");
+    await createAtomFromString(intuitionConfig, METADATA_PREDICATE);
+    console.log("Metadata predicate atom created:", predicateAtomId);
+  } else {
+    console.log("Metadata predicate atom already exists:", predicateAtomId);
+  }
+
+  return predicateAtomId;
+}
 
 const router = Router();
 
@@ -116,8 +174,16 @@ async function handleQuizCompletedEvent(event: QuizCompletedEvent) {
 export default router;
 
 // New endpoint: POST /v1/intuition/
-// Accepts any-level-deep JSON payload, flattens to one-level key/value pairs,
-// and syncs under the DID derived from SIGNER (account.address)
+// Accepts a Thing object (name, description, url, image) and optional metadata.
+// Flow:
+// 1. Upload thing to IPFS -> get uriRef
+// 2. Check if thing atom exists on-chain
+// 3. If not, create thing atom
+// 4. Upload metadata to IPFS -> get uriRef
+// 5. Check if metadata atom exists on-chain
+// 6. If not, create metadata atom
+// 7. Create triple (thing -> metadata predicate -> metadata atom)
+// Always returns the IDs for thing, metadata, and triple
 router.post(
   "/v1/intuition/",
   validateApiKey,
@@ -129,59 +195,208 @@ router.post(
         res.status(400).json({
           success: false,
           error: "Invalid payload",
-          message: "Expected a JSON object with key/value pairs",
+          message: "Expected a JSON object with 'thing' field",
         });
         return;
       }
 
-      // Flatten nested objects into a single-level key/value map.
-      // Arrays are kept as-is. Nested objects inside arrays will be stringified.
-      const flatData = flattenToOneLevel(payload);
+      const body = payload as IntuitionSyncRequest;
 
-      if (Object.keys(flatData).length === 0) {
+      // Validate thing object
+      if (!body.thing || typeof body.thing !== "object") {
         res.status(400).json({
           success: false,
-          error: "Empty payload",
-          message: "Provided object did not contain any usable key/value pairs",
+          error: "Missing thing",
+          message: "Request must include a 'thing' object with name, description, url, and image",
         });
         return;
       }
 
-      const did = `did:eth:${account.address.toLowerCase()}`;
-      const normalized: Record<string, string | string[]> = normalizeFlatValues(flatData);
-      const syncData: Record<string, Record<string, string | string[]>> = {
-        [did]: normalized,
+      const { name, description, url, image } = body.thing;
+
+      // Validate required Thing fields
+      if (!name || typeof name !== "string") {
+        res.status(400).json({
+          success: false,
+          error: "Invalid thing",
+          message: "thing.name is required and must be a string",
+        });
+        return;
+      }
+      if (!description || typeof description !== "string") {
+        res.status(400).json({
+          success: false,
+          error: "Invalid thing",
+          message: "thing.description is required and must be a string",
+        });
+        return;
+      }
+      if (!url || typeof url !== "string") {
+        res.status(400).json({
+          success: false,
+          error: "Invalid thing",
+          message: "thing.url is required and must be a string",
+        });
+        return;
+      }
+      if (!image || typeof image !== "string") {
+        res.status(400).json({
+          success: false,
+          error: "Invalid thing",
+          message: "thing.image is required and must be a string",
+        });
+        return;
+      }
+
+      // Require Pinata API token for all operations (thing + metadata go to IPFS)
+      if (!pinataApiToken) {
+        res.status(500).json({
+          success: false,
+          error: "IPFS not configured",
+          message: "PINATA_API_JWT must be set to upload data",
+        });
+        return;
+      }
+
+      console.log("========================================");
+      console.log("Processing Thing + Metadata sync");
+      console.log("========================================");
+
+      // ================================================================
+      // Step 1: Upload thing to IPFS (using schema.org JSON-LD format)
+      // ================================================================
+      console.log("Step 1: Uploading thing to IPFS...");
+      const thingData = {
+        "@context": "https://schema.org",
+        "@type": "Thing",
+        name,
+        description,
+        url,
+        image,
       };
+      const thingUpload = await uploadJsonToPinata(pinataApiToken, thingData);
+      const thingIpfsUri = `ipfs://${thingUpload.IpfsHash}` as `ipfs://${string}`;
+      console.log("  Thing IPFS URI:", thingIpfsUri);
 
-      console.log("Syncing generic data to blockchain...");
-      console.log("  DID:", did);
-      console.log("  Data:", JSON.stringify(syncData, null, 2));
+      // ================================================================
+      // Step 2: Check if thing atom exists on-chain
+      // ================================================================
+      console.log("Step 2: Checking if thing atom exists...");
+      const thingAtomData = toHex(thingIpfsUri);
+      const thingAtomId = calculateAtomId(thingAtomData);
+      const thingAtomExists = await isTermCreated(thingAtomId);
+      console.log("  Thing Atom ID:", thingAtomId);
+      console.log("  Exists:", thingAtomExists);
 
-      try {
-        await sync(intuitionConfig, syncData);
-        res.status(200).json({
-          success: true,
-          message: "Data received and synced",
-          did,
-          keys: Object.keys(flatData).length,
-          timestamp: new Date().toISOString(),
-        });
-        return;
-      } catch (error: any) {
-        if (isAlreadyExistsError(error)) {
-          res.status(200).json({
-            success: true,
-            message: "Idempotent no-op: data already exists",
-            did,
-            keys: Object.keys(flatData).length,
-            timestamp: new Date().toISOString(),
-          });
-          return;
-        }
-        throw error;
+      // ================================================================
+      // Step 3: Create thing atom if it doesn't exist
+      // ================================================================
+      let thingAtomCreated = false;
+      if (!thingAtomExists) {
+        console.log("Step 3: Creating thing atom...");
+        await createAtomFromIpfsUri(intuitionConfig, thingIpfsUri);
+        thingAtomCreated = true;
+        console.log("  Thing atom created");
+      } else {
+        console.log("Step 3: Thing atom already exists, skipping creation");
       }
+
+      // ================================================================
+      // Step 4: Upload metadata to IPFS (if provided)
+      // ================================================================
+      let metadataAtomId: Hex | null = null;
+      let metadataIpfsUri: string | null = null;
+      let tripleId: Hex | null = null;
+
+      if (body.metadata && Object.keys(body.metadata).length > 0) {
+        console.log("Step 4: Uploading metadata to IPFS...");
+        const metadataUpload = await uploadJsonToPinata(pinataApiToken, body.metadata);
+        metadataIpfsUri = `ipfs://${metadataUpload.IpfsHash}`;
+        console.log("  Metadata IPFS URI:", metadataIpfsUri);
+
+        // ================================================================
+        // Step 5: Check if metadata atom exists on-chain
+        // ================================================================
+        console.log("Step 5: Checking if metadata atom exists...");
+        const metadataAtomData = toHex(metadataIpfsUri);
+        metadataAtomId = calculateAtomId(metadataAtomData);
+        const metadataAtomExists = await isTermCreated(metadataAtomId);
+        console.log("  Metadata Atom ID:", metadataAtomId);
+        console.log("  Exists:", metadataAtomExists);
+
+        // ================================================================
+        // Step 6: Create metadata atom if it doesn't exist
+        // ================================================================
+        if (!metadataAtomExists) {
+          console.log("Step 6: Creating metadata atom...");
+          await createAtomFromIpfsUri(intuitionConfig, metadataIpfsUri as `ipfs://${string}`);
+          console.log("  Metadata atom created");
+        } else {
+          console.log("Step 6: Metadata atom already exists, skipping creation");
+        }
+
+        // ================================================================
+        // Step 7: Get or create metadata predicate atom, then create triple
+        // ================================================================
+        console.log("Step 7: Getting/creating metadata predicate atom...");
+        const predicateAtomId = await getOrCreateMetadataPredicateAtom();
+
+        // Calculate triple ID
+        tripleId = calculateTripleId(thingAtomId, predicateAtomId, metadataAtomId);
+        console.log("  Triple ID:", tripleId);
+
+        // Check if triple exists
+        const tripleExists = await isTermCreated(tripleId);
+        console.log("  Triple exists:", tripleExists);
+
+        if (!tripleExists) {
+          console.log("  Creating triple...");
+          // Get triple cost for the transaction value
+          const tripleCost = await getTripleCost({
+            publicClient: intuitionConfig.publicClient,
+            address: intuitionConfig.address,
+          });
+
+          await createTripleStatement(intuitionConfig, {
+            args: [[thingAtomId], [predicateAtomId], [metadataAtomId], [tripleCost]],
+            value: tripleCost,
+          });
+
+          const normalized: Record<string, string | string[]> = normalizeFlatValues(body.metadata);
+          const syncData: Record<string, Record<string, string | string[]>> = {
+            [thingIpfsUri]: normalized,
+          };
+
+    
+          const data = await sync(intuitionConfig, syncData);
+          console.log("  Triple created", data);
+        } else {
+          console.log("  Triple already exists, skipping creation");
+        }
+      }
+
+      console.log("========================================");
+      console.log("Sync complete!");
+      console.log("========================================");
+
+      // Always return all the IDs
+      res.status(200).json({
+        success: true,
+        message: metadataAtomId
+          ? "Thing and metadata synced to Intuition"
+          : "Thing synced to Intuition",
+        thingAtomId,
+        thingIpfsUri,
+        thingAtomCreated,
+        ...(metadataAtomId && {
+          metadataAtomId,
+          metadataIpfsUri,
+          tripleId,
+        }),
+        timestamp: new Date().toISOString(),
+      });
     } catch (error: any) {
-      console.error("Generic intuition sync error:", error);
+      console.error("Intuition sync error:", error);
       res.status(500).json({
         success: false,
         error: "Sync failed",
