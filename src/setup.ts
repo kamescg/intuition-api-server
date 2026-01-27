@@ -99,3 +99,10 @@ export const intuitionConfig: any = {
   publicClient,
   address: getMultiVaultAddressFromChainId(intuitionTestnet.id),
 };
+
+// Pinata API token for IPFS uploads (used with SDK's uploadJsonToPinata)
+export const pinataApiToken = process.env.PINATA_API_JWT;
+
+if (!pinataApiToken) {
+  console.warn("Warning: PINATA_API_JWT not set - IPFS upload features will be disabled");
+}
