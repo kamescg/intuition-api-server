@@ -18,18 +18,15 @@ const CONFIG = {
 // Note: The API will wrap this in schema.org JSON-LD format automatically:
 // { "@context": "https://schema.org", "@type": "Thing", name, description, url, image }
 const THING_DATA = {
-  name: "Samgent Agent",
-  description: "This is an example of an agent that can be used to test the Intuition sync endpoint.",
+  name: "Test Item",
+  description: "A test item for debugging the endpoint",
   url: "https://example.com",
   image: "https://res.cloudinary.com/dfpwy9nyv/image/upload/v1765857637/remix/oaw5u4augbngear7hham.webp",
 };
 
 const METADATA = {
+  test: true,
   version: "1.0.0",
-  author: "OpenAndClosedAI",
-  tag: ["ai-agent", "demo", "test"],
-  organization: "OpenAndClosedAI",
-  website: "https://closedai.com",
 };
 
 // =============================================================================
